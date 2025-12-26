@@ -5,6 +5,16 @@ use chinese_clip_rs::{ImageProcessor, TextProcessor};
 use log::info;
 use tokio::sync::Mutex;
 use anyhow::{Result, Context};
+use serde::{Deserialize, Serialize};
+
+// Import new models
+pub mod face_detection;
+pub mod face_recognition;
+pub mod multilingual_clip;
+
+use face_detection::FaceDetectionModel;
+use face_recognition::FaceRecognitionModel;
+use multilingual_clip::SiglipModel;
 
 // 模型特征
 pub trait Model: Send + Sync {
@@ -19,12 +29,15 @@ pub enum ModelInput {
 }
 
 // 模型输出
-#[derive(Debug, Clone)]
-pub struct ModelOutput {
-    pub features: Vec<f32>,
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ModelOutput {
+    Clip(Vec<f32>),
+    FaceDetection(face_detection::FaceDetectionOutput),
+    FaceRecognition(face_recognition::FaceRecognitionOutput),
 }
 
-// 图像处理模型
+// 图像处理模型 (Chinese CLIP)
 pub struct ImageModel {
     processor: ImageProcessor,
     image_size: (u32, u32),
@@ -45,14 +58,14 @@ impl Model for ImageModel {
         match input {
             ModelInput::Image(image_data) => {
                 let features = self.processor.process_image(image_data)?;
-                Ok(ModelOutput { features })
+                Ok(ModelOutput::Clip(features))
             }
             _ => Err(anyhow::anyhow!("Invalid input type for ImageModel")),
         }
     }
 }
 
-// 文本处理模型
+// 文本处理模型 (Chinese CLIP)
 pub struct TextModel {
     processor: TextProcessor,
     max_length: usize,
@@ -73,12 +86,108 @@ impl Model for TextModel {
         match input {
             ModelInput::Text(text) => {
                 let features = self.processor.process_text(text)?;
-                Ok(ModelOutput { features })
+                Ok(ModelOutput::Clip(features))
             }
             _ => Err(anyhow::anyhow!("Invalid input type for TextModel")),
         }
     }
 }
+
+// Wrapper for Face Detection
+pub struct FaceDetectionModelWrapper {
+    inner: FaceDetectionModel,
+}
+
+impl FaceDetectionModelWrapper {
+    pub fn new(model_path: &str) -> Result<Self> {
+        Ok(Self {
+            inner: FaceDetectionModel::new(model_path)?,
+        })
+    }
+}
+
+impl Model for FaceDetectionModelWrapper {
+    fn process(&self, input: &ModelInput) -> Result<ModelOutput> {
+        match input {
+            ModelInput::Image(image_data) => {
+                let output = self.inner.process(image_data)?;
+                Ok(ModelOutput::FaceDetection(output))
+            }
+            _ => Err(anyhow::anyhow!("Invalid input for Face Detection")),
+        }
+    }
+}
+
+// Wrapper for Face Recognition
+pub struct FaceRecognitionModelWrapper {
+    inner: FaceRecognitionModel,
+}
+
+impl FaceRecognitionModelWrapper {
+    pub fn new(model_path: &str) -> Result<Self> {
+        Ok(Self {
+            inner: FaceRecognitionModel::new(model_path)?,
+        })
+    }
+}
+
+impl Model for FaceRecognitionModelWrapper {
+    fn process(&self, input: &ModelInput) -> Result<ModelOutput> {
+        match input {
+            ModelInput::Image(image_data) => {
+                let img = image::load_from_memory(image_data)?;
+                let output = self.inner.process(&img)?;
+                Ok(ModelOutput::FaceRecognition(output))
+            }
+            _ => Err(anyhow::anyhow!("Invalid input for Face Recognition")),
+        }
+    }
+}
+
+// Wrapper for SigLIP (Multilingual CLIP)
+pub struct SiglipModelWrapper {
+    inner: SiglipModel,
+    is_text: bool,
+}
+
+impl SiglipModelWrapper {
+    pub fn new_vision(model_path: &str) -> Result<Self> {
+        Ok(Self {
+            inner: SiglipModel::new_vision(model_path)?,
+            is_text: false,
+        })
+    }
+
+    pub fn new_text(model_path: &str, tokenizer_path: &str) -> Result<Self> {
+        Ok(Self {
+            inner: SiglipModel::new_text(model_path, tokenizer_path)?,
+            is_text: true,
+        })
+    }
+}
+
+impl Model for SiglipModelWrapper {
+    fn process(&self, input: &ModelInput) -> Result<ModelOutput> {
+        if self.is_text {
+             match input {
+                ModelInput::Text(text) => {
+                    let features = self.inner.process_text(text)?;
+                    Ok(ModelOutput::Clip(features))
+                }
+                _ => Err(anyhow::anyhow!("Invalid input type for Siglip Text")),
+            }
+        } else {
+             match input {
+                ModelInput::Image(image_data) => {
+                    let features = self.inner.process_image(image_data)?;
+                    Ok(ModelOutput::Clip(features))
+                }
+                _ => Err(anyhow::anyhow!("Invalid input type for Siglip Vision")),
+            }
+        }
+    }
+}
+
 
 // 模型实例包装
 struct ModelInstance {
@@ -101,10 +210,14 @@ pub struct ModelConfig {
     pub max_length: Option<usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ModelType {
     Image,
     Text,
+    FaceDetection,
+    FaceRecognition,
+    SiglipVision,
+    SiglipText,
 }
 
 impl ModelManager {
@@ -117,6 +230,14 @@ impl ModelManager {
 
     pub fn register_model(&mut self, name: String, config: ModelConfig) {
         self.model_configs.insert(name, config);
+    }
+
+    // Allow directly injecting a model instance (useful for testing or manual loading)
+    pub fn register_model_instance(&mut self, name: String, model: Arc<dyn Model>) {
+        self.models.insert(name, ModelInstance {
+            model,
+            last_used: Instant::now(),
+        });
     }
 
     pub async fn get_or_load_model(&mut self, name: &str) -> Result<Arc<dyn Model>> {
@@ -139,6 +260,7 @@ impl ModelManager {
     }
 
     async fn load_model(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
+        info!("Loading model type: {:?}", config.model_type);
         match config.model_type {
             ModelType::Image => {
                 let image_size = config.image_size.ok_or_else(|| 
@@ -159,6 +281,20 @@ impl ModelManager {
                     max_length,
                 )?))
             }
+            ModelType::FaceDetection => {
+                Ok(Arc::new(FaceDetectionModelWrapper::new(&config.model_path)?))
+            }
+            ModelType::FaceRecognition => {
+                Ok(Arc::new(FaceRecognitionModelWrapper::new(&config.model_path)?))
+            }
+            ModelType::SiglipVision => {
+                Ok(Arc::new(SiglipModelWrapper::new_vision(&config.model_path)?))
+            }
+            ModelType::SiglipText => {
+                 let tokenizer_path = config.tokenizer_path.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Tokenizer path not specified"))?;
+                Ok(Arc::new(SiglipModelWrapper::new_text(&config.model_path, tokenizer_path)?))
+            }
         }
     }
 
@@ -171,17 +307,6 @@ impl ModelManager {
             }
             retain
         });
-    }
-
-    fn cleanup_oldest_model(&mut self) {
-        if let Some((oldest_key, _)) = self.models
-            .iter()
-            .min_by_key(|(_, instance)| instance.last_used)
-            .map(|(k, _)| (k.clone(), ())) {
-
-            info!("清理最旧模型: {}", oldest_key);
-            self.models.remove(&oldest_key);
-        }
     }
 }
 
@@ -200,6 +325,11 @@ impl SafeModelManager {
     pub async fn register_model(&self, name: String, config: ModelConfig) {
         let mut manager = self.inner.lock().await;
         manager.register_model(name, config);
+    }
+
+    pub async fn register_model_instance(&self, name: String, model: Arc<dyn Model>) {
+        let mut manager = self.inner.lock().await;
+        manager.register_model_instance(name, model);
     }
 
     pub async fn get_model(&self, name: &str) -> Result<Arc<dyn Model>> {
