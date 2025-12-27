@@ -1,49 +1,89 @@
 # Immich 机器学习识别服务
 
-这是一个为 Immich 照片管理系统开发的独立机器学习服务，基于 Chinese-CLIP 模型，用于实现图片识别和中文文本理解功能。
+这是一个为 Immich 照片管理系统开发的独立机器学习服务，支持中文文本理解（Chinese-CLIP）、人脸识别（Buffalo_L）以及多语言 CLIP 模型。
 
 ## 主要特性
 
-- 支持图片-文本跨模态理解
-- 支持中文文本处理
-- 支持多种硬件加速方案:
-  - CUDA (NVIDIA GPU)
-  - DirectX 12 
-  - TensorRT
-  - CPU
+- **多模态理解**: 支持 Chinese-CLIP 和 Multilingual CLIP (SigLIP) 进行图片-文本跨模态搜索。
+- **人脸识别**: 支持人脸检测和识别 (Buffalo_L / SCRFD + ArcFace)。
+- **高性能**: 基于 Rust 和 ONNX Runtime 开发。
+- **硬件加速**: 支持 CUDA (NVIDIA GPU)、DirectX 12 (DirectML) 和 TensorRT。
+- **灵活配置**: 支持端口配置和模型预加载。
 
-## 支持的模型
+## 快速开始
 
-目前支持以下预训练模型:
+### 1. 下载模型文件
 
-### ViT-B-16 (Immich模型名称: ViT-B-16__openai)
-- 图像编码器: [ViT-B-16.img.fp32.onnx](https://www.modelscope.cn/models/deadash/chinese_clip_ViT-B-16/resolve/master/models/Vit-B-16.img.fp32.onnx)
-- 文本编码器: [ViT-B-16.txt.fp32.onnx](https://www.modelscope.cn/models/deadash/chinese_clip_ViT-B-16/resolve/master/models/Vit-B-16.txt.fp32.onnx)
-- 输入图像尺寸: 224x224
+请将模型文件下载并放置在 `models` 目录下。目录结构如下：
 
-### ViT-L-14 (Immich模型名称: ViT-L-14__openai)
-- 图像编码器: [ViT-L-14.img.fp32.onnx](https://www.modelscope.cn/models/deadash/chinese_clip_ViT-L-14/resolve/master/models/Vit-L-14.img.fp32.onnx)
-- 文本编码器: [ViT-L-14.txt.fp32.onnx](https://www.modelscope.cn/models/deadash/chinese_clip_ViT-L-14/resolve/master/models/Vit-L-14.txt.fp32.onnx)
-- 输入图像尺寸: 224x224
+```
+models/
+├── clip_cn_tokenizer.json             # Chinese-CLIP 分词器
+├── ViT-B-16.img.fp32.onnx             # Chinese-CLIP ViT-B-16 图像模型
+├── ViT-B-16.txt.fp32.onnx             # Chinese-CLIP ViT-B-16 文本模型
+├── buffalo_l/
+│   ├── det_10g.onnx                   # 人脸检测模型 (SCRFD)
+│   └── w600k_r50.onnx                 # 人脸识别模型 (ArcFace)
+└── nllb-clip-large-siglip__v1/
+    ├── vision.onnx                    # SigLIP 图像模型
+    ├── text.onnx                      # SigLIP 文本模型
+    └── tokenizer.json                 # SigLIP 分词器
+```
 
-### ViT-L-14-336 (Immich模型名称: ViT-L-14-336__openai)
-- 图像编码器: [ViT-L-14-336.img.fp32.onnx](https://www.modelscope.cn/models/deadash/chinese_clip_ViT-L-14-336/resolve/master/models/Vit-L-14-336.img.fp32.onnx)
-- 文本编码器: [ViT-L-14-336.txt.fp32.onnx](https://www.modelscope.cn/models/deadash/chinese_clip_ViT-L-14-336/resolve/master/models/Vit-L-14-336.txt.fp32.onnx)
-- 输入图像尺寸: 336x336
+**模型下载地址：**
 
-### 分词器
-所有文本模型共用同一个分词器:
-- [clip_cn_tokenizer.json](https://www.modelscope.cn/models/deadash/chinese_clip/resolve/master/clip_cn_tokenizer.json)
+- **Chinese-CLIP**: [ModelScope - Chinese-CLIP](https://www.modelscope.cn/models/deadash/chinese_clip_ViT-B-16/summary) (需下载对应的 ONNX 文件)
+- **Buffalo_L (人脸识别)**: 通常包含在 Immich 的默认模型库中，也可从 [InsightFace](https://github.com/deepinsight/insightface) 或 Immich 提供的 HuggingFace 镜像下载。
+- **Multilingual CLIP (SigLIP)**: 可从 [Immich HuggingFace](https://huggingface.co/immich-app/nllb-clip-large-siglip__v1) 下载。
 
-## 使用说明
+### 2. 运行服务
 
-1. 下载所需模型文件到 `models` 目录
-2. 确保分词器文件 `clip_cn_tokenizer.json` 位于 `models` 目录
-3. 程序会自动注册所有可用的模型
-4. 可以通过配置选择合适的硬件加速方案
+默认监听端口为 3003。
 
-## 性能建议
+```bash
+# 默认运行
+cargo run --release
 
-- ViT-B-16: 适合普通场景，性能和精度平衡
-- ViT-L-14: 更高的精度，需要更多计算资源
-- ViT-L-14-336: 支持更大的输入图像，适合需要更细节识别的场景
+# 指定端口
+cargo run --release -- --port 3004
+```
+
+或者构建后运行：
+
+```bash
+./target/release/immich_ml --port 3004
+```
+
+### 3. 环境变量配置
+
+支持通过环境变量进行配置：
+
+- `RUST_LOG`: 日志级别 (默认 `debug,actix_web=debug`)。
+- `MACHINE_LEARNING_PRELOAD__CLIP__TEXTUAL`: 指定启动时预加载的文本模型名称 (例如 `ViT-B-16__openai`)。
+
+## 支持的模型列表
+
+| 功能 | 模型名称 (Immich ID) | 对应文件 |
+| --- | --- | --- |
+| 中文搜索 | `ViT-B-16__openai` | `ViT-B-16.img.fp32.onnx`, `ViT-B-16.txt.fp32.onnx` |
+| 中文搜索 (大模型) | `ViT-L-14__openai` | `ViT-L-14.img.fp32.onnx`, `ViT-L-14.txt.fp32.onnx` |
+| 人脸识别 | `buffalo_l` | `buffalo_l/det_10g.onnx` (检测), `buffalo_l/w600k_r50.onnx` (识别) |
+| 多语言搜索 | `nllb-clip-large-siglip__v1` | `nllb-clip-large-siglip__v1/vision.onnx`, `text.onnx` |
+
+## 开发与构建
+
+**依赖要求:**
+- Rust (最新稳定版)
+- CUDA / TensorRT / DirectML (根据所需的硬件加速后端)
+
+**构建:**
+
+```bash
+cargo build --release
+```
+
+**测试:**
+
+```bash
+cargo test
+```

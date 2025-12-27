@@ -9,17 +9,65 @@ use std::time::Duration;
 use log::{info, error};
 use actix_web::middleware::Logger;
 use crate::models::SafeModelManager;
-
 use std::collections::HashMap;
 use std::env;
 use std::panic;
-
 use image::{DynamicImage, GenericImageView};
 
 mod models;
 mod model_registry;
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Model, ModelInput, ModelOutput, SafeModelManager, face_detection::FaceDetectionOutput};
+    use std::sync::Arc;
+
+    // Mock Models
+    struct MockClipModel;
+    impl Model for MockClipModel {
+        fn process(&self, _input: &ModelInput) -> Result<ModelOutput, anyhow::Error> {
+            Ok(ModelOutput::Clip(vec![0.1, 0.2, 0.3]))
+        }
+    }
+
+    struct MockFaceDetectionModel;
+    impl Model for MockFaceDetectionModel {
+        fn process(&self, _input: &ModelInput) -> Result<ModelOutput, anyhow::Error> {
+            Ok(ModelOutput::FaceDetection(FaceDetectionOutput {
+                boxes: vec![[0.0, 0.0, 100.0, 100.0]],
+                scores: vec![0.99],
+                landmarks: vec![],
+            }))
+        }
+    }
+
+    struct MockFaceRecognitionModel;
+    impl Model for MockFaceRecognitionModel {
+        fn process(&self, _input: &ModelInput) -> Result<ModelOutput, anyhow::Error> {
+            Ok(ModelOutput::FaceRecognition(crate::models::face_recognition::FaceRecognitionOutput {
+                 embedding: vec![0.5, 0.5]
+            }))
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_clip_prediction() {
+        let model_manager = SafeModelManager::new();
+        model_manager.register_model_instance("ViT-B-16__openai".to_string(), Arc::new(MockClipModel)).await;
+        model_manager.register_model_instance("ViT-B-16__openai_text".to_string(), Arc::new(MockClipModel)).await;
+
+        let state = web::Data::new(AppState { model_manager });
+
+        let model = state.model_manager.get_model("ViT-B-16__openai").await.unwrap();
+        let output = model.process(&models::ModelInput::Text("test".to_string())).unwrap();
+        if let models::ModelOutput::Clip(features) = output {
+            assert_eq!(features, vec![0.1, 0.2, 0.3]);
+        } else {
+            panic!("Wrong output type");
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -165,19 +213,8 @@ async fn predict(
                             // TODO: Add full 5-point affine alignment here using output.landmarks[i]
                             let face_crop = crop_face(&original_img, bbox);
 
-                            // Encode crop back to bytes or passed as image object?
-                            // Our ModelInput expects Bytes or Text.
-                            // We need to update ModelInput to accept DynamicImage or Bytes.
-                            // Or re-encode to bytes (slow).
-                            // Let's optimize: Update FaceRecognitionModelWrapper to accept ImageInput that can be bytes OR raw.
-
-                            // For now, re-encode to memory is simplest (though slower).
-                            let mut buffer = std::io::Cursor::new(Vec::new());
-                            face_crop.write_to(&mut buffer, image::ImageOutputFormat::Jpeg(90))
-                                .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
-                            let crop_bytes = buffer.into_inner();
-
-                            let rec_output = rec_model.process(&models::ModelInput::Image(crop_bytes))
+                            // Pass the crop directly to the recognition model (optimized path)
+                            let rec_output = rec_model.process(&models::ModelInput::ImageRaw(face_crop))
                                 .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
 
                             if let models::ModelOutput::FaceRecognition(rec_result) = rec_output {
@@ -308,57 +345,4 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", args.port))?
     .run()
     .await
-}
-#[cfg(test)]
-mod tests {
-    use super::*; use std::sync::Arc;
-    use actix_web::{test, web, App};
-    use serde_json::json;
-    use crate::models::{Model, ModelInput, ModelOutput, SafeModelManager, face_detection::FaceDetectionOutput};
-
-    // Mock Models
-    struct MockClipModel;
-    impl Model for MockClipModel {
-        fn process(&self, _input: &ModelInput) -> Result<ModelOutput, anyhow::Error> {
-            Ok(ModelOutput::Clip(vec![0.1, 0.2, 0.3]))
-        }
-    }
-
-    struct MockFaceDetectionModel;
-    impl Model for MockFaceDetectionModel {
-        fn process(&self, _input: &ModelInput) -> Result<ModelOutput, anyhow::Error> {
-            Ok(ModelOutput::FaceDetection(FaceDetectionOutput {
-                boxes: vec![[0.0, 0.0, 100.0, 100.0]],
-                scores: vec![0.99],
-                landmarks: vec![],
-            }))
-        }
-    }
-
-    struct MockFaceRecognitionModel;
-    impl Model for MockFaceRecognitionModel {
-        fn process(&self, _input: &ModelInput) -> Result<ModelOutput, anyhow::Error> {
-            Ok(ModelOutput::FaceRecognition(crate::models::face_recognition::FaceRecognitionOutput {
-                 embedding: vec![0.5, 0.5]
-            }))
-        }
-    }
-
-    #[actix_web::test]
-    async fn test_clip_prediction() {
-        let model_manager = SafeModelManager::new();
-        model_manager.register_model_instance("ViT-B-16__openai".to_string(), Arc::new(MockClipModel)).await;
-        model_manager.register_model_instance("ViT-B-16__openai_text".to_string(), Arc::new(MockClipModel)).await;
-
-        let state = web::Data::new(AppState { model_manager });
-
-        // We can check if `SafeModelManager` works as expected.
-        let model = state.model_manager.get_model("ViT-B-16__openai").await.unwrap();
-        let output = model.process(&models::ModelInput::Text("test".to_string())).unwrap();
-        if let models::ModelOutput::Clip(features) = output {
-            assert_eq!(features, vec![0.1, 0.2, 0.3]);
-        } else {
-            panic!("Wrong output type");
-        }
-    }
 }

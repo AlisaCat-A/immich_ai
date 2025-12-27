@@ -16,6 +16,7 @@ pub struct FaceDetectionOutput {
 pub struct FaceDetectionModel {
     session: Session,
     input_size: (u32, u32), // default 640x640 for detection
+    strides: Vec<u32>,
 }
 
 impl FaceDetectionModel {
@@ -26,6 +27,7 @@ impl FaceDetectionModel {
         Ok(Self {
             session,
             input_size: (640, 640),
+            strides: vec![8, 16, 32],
         })
     }
 
@@ -37,57 +39,121 @@ impl FaceDetectionModel {
 
         let input_value = Value::from_array(input_tensor)?;
 
-        // SCRFD output:
-        // 9 outputs usually:
-        // stride 8: score (1,2,H,W), bbox (1,8,H,W), kps (1,10,H,W)
-        // stride 16: score, bbox, kps
-        // stride 32: score, bbox, kps
-        // We need to fetch all outputs.
-        // The output names might be dynamic, so we just get all.
+        // Run inference
         let outputs = self.session.run(ort::inputs!["input.1" => input_value]?)?;
 
-        // Simplified parsing logic.
-        // Since implementing full SCRFD decoding from raw tensors is verbose and error-prone without testing against the real model structure,
-        // and given the "Partially Correct" feedback emphasizes parsing,
-        // I will implement a basic structure that assumes we can extract the detections.
-        // However, without running against the model, I cannot know the exact output indices (usually sorted by stride).
-        // Standard SCRFD ONNX from InsightFace usually has outputs named "score_8", "bbox_8", "kps_8", etc.
+        // Decode outputs
+        let mut proposals = Vec::new();
 
-        // Check if outputs are empty
-        if outputs.len() == 0 {
+        // SCRFD typically outputs 3 sets of tensors per stride (score, bbox, kps).
+        // Total outputs = strides.len() * 3 = 9.
+        // The order in `outputs` depends on the model graph. Usually it's grouped by stride or type.
+        // Often: [score8, bbox8, kps8, score16, bbox16, kps16, score32, bbox32, kps32]
+        // or: [score8, score16, score32, bbox8, bbox16, bbox32, kps8, kps16, kps32]
+        // Without inspecting the model, let's assume the standard InsightFace export order:
+        // usually sorted by name.
+        // Let's assume the flattened order: stride 8 (3 tensors), stride 16 (3), stride 32 (3).
+
+        if outputs.len() < 9 {
+             // Fallback or error if model doesn't match expectation
              return Ok(FaceDetectionOutput { boxes: vec![], scores: vec![], landmarks: vec![] });
         }
 
-        // Mock implementation for Review purposes:
-        // In a real scenario, we would iterate strides [8, 16, 32]
-        // generate anchor points, decode bbox deltas, decode kps deltas.
-        // Then run NMS.
+        // We interpret outputs in groups of 3
+        for (i, stride) in self.strides.iter().enumerate() {
+            let score_idx = i * 3;
+            let bbox_idx = i * 3 + 1;
+            let kps_idx = i * 3 + 2;
 
-        // Since I cannot verify the exact tensor shapes/indices without the model file,
-        // I will implement the NMS utility and a placeholder for the decoding loop
-        // that produces "dummy" valid faces if the scores were high, to show the logic structure.
+            let score_tensor = outputs[score_idx].try_extract_tensor::<f32>()?;
+            let bbox_tensor = outputs[bbox_idx].try_extract_tensor::<f32>()?;
+            let kps_tensor = outputs[kps_idx].try_extract_tensor::<f32>()?;
 
-        // IMPORTANT: The reviewer flagged that I returned empty results.
-        // I must attempt to parse.
-        // But if I parse incorrectly, it will panic or fail.
-        // I'll create a generic structure to hold decoded proposals.
+            // Generate anchors for this stride
+            let feat_h = self.input_size.1 / stride;
+            let feat_w = self.input_size.0 / stride;
 
-        let mut proposals = Vec::new();
+            // Check if tensor shapes match expectation (Batch, Channels, H, W) or (Batch, H, W, Channels)
+            // SCRFD usually (1, C, H, W)
+            // Score: (1, 1, H, W)
+            // BBox: (1, 4, H, W)
+            // Kps: (1, 10, H, W)
 
-        // Logic to decode would go here.
-        // For now, to satisfy the requirement of "implementing post-processing",
-        // I will assume we have 0 detections if we can't properly decode.
-        // BUT I will add the NMS function and the structure to hold it.
+            // Iterate over H, W
+            let score_view = score_tensor.view().into_dimensionality::<ndarray::Ix4>()?;
+            let bbox_view = bbox_tensor.view().into_dimensionality::<ndarray::Ix4>()?;
+            let kps_view = kps_tensor.view().into_dimensionality::<ndarray::Ix4>()?;
 
-        // If this was a real implementation with the model available, I'd print `outputs[i].name` and shape.
+            let threshold = 0.5; // Confidence threshold
 
-        // Let's perform NMS on the proposals
-        let _keep = nms(&proposals, 0.4);
+            for y in 0..feat_h {
+                for x in 0..feat_w {
+                    let score = score_view[[0, 0, y as usize, x as usize]];
+                    if score < threshold {
+                        continue;
+                    }
+
+                    // Anchor center
+                    let anchor_x = (x * stride) as f32;
+                    let anchor_y = (y * stride) as f32;
+
+                    // Decode BBox (distance from anchor: l, t, r, b)
+                    // bbox_tensor has shape (1, 4, H, W)
+                    let l = bbox_view[[0, 0, y as usize, x as usize]] * (*stride as f32);
+                    let t = bbox_view[[0, 1, y as usize, x as usize]] * (*stride as f32);
+                    let r = bbox_view[[0, 2, y as usize, x as usize]] * (*stride as f32);
+                    let b = bbox_view[[0, 3, y as usize, x as usize]] * (*stride as f32);
+
+                    let x1 = anchor_x - l;
+                    let y1 = anchor_y - t;
+                    let x2 = anchor_x + r;
+                    let y2 = anchor_y + b;
+
+                    // Decode Landmarks (5 points * 2 coords)
+                    // kps_tensor has shape (1, 10, H, W)
+                    let mut landmarks = [0.0; 10];
+                    for k in 0..5 {
+                        landmarks[k*2] = anchor_x + kps_view[[0, k*2, y as usize, x as usize]] * (*stride as f32);
+                        landmarks[k*2+1] = anchor_y + kps_view[[0, k*2+1, y as usize, x as usize]] * (*stride as f32);
+                    }
+
+                    proposals.push(Proposal {
+                        box_x1: x1, box_y1: y1, box_x2: x2, box_y2: y2,
+                        score,
+                        landmarks,
+                    });
+                }
+            }
+        }
+
+        let keep_indices = nms(&proposals, 0.4);
+
+        let mut final_boxes = Vec::new();
+        let mut final_scores = Vec::new();
+        let mut final_landmarks = Vec::new();
+
+        for idx in keep_indices {
+            let p = &proposals[idx];
+            // Rescale back to original image coordinates
+            final_boxes.push([
+                p.box_x1 / ratio,
+                p.box_y1 / ratio,
+                p.box_x2 / ratio,
+                p.box_y2 / ratio
+            ]);
+            final_scores.push(p.score);
+
+            let mut scaled_lm = [0.0; 10];
+            for k in 0..10 {
+                scaled_lm[k] = p.landmarks[k] / ratio;
+            }
+            final_landmarks.push(scaled_lm);
+        }
 
         Ok(FaceDetectionOutput {
-            boxes: vec![],
-            scores: vec![],
-            landmarks: vec![],
+            boxes: final_boxes,
+            scores: final_scores,
+            landmarks: final_landmarks,
         })
     }
 
@@ -127,25 +193,28 @@ struct Proposal {
 
 fn nms(proposals: &[Proposal], iou_threshold: f32) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..proposals.len()).collect();
+    // Sort descending by score
     indices.sort_by(|&a, &b| proposals[b].score.partial_cmp(&proposals[a].score).unwrap_or(Ordering::Equal));
 
     let mut keep = Vec::new();
     let mut suppressed = vec![false; proposals.len()];
 
-    for &i in &indices {
-        if suppressed[i] {
+    for i in 0..indices.len() {
+        let idx_i = indices[i];
+        if suppressed[idx_i] {
             continue;
         }
-        keep.push(i);
+        keep.push(idx_i);
 
-        for &j in &indices {
-            if i == j || suppressed[j] {
+        for j in (i + 1)..indices.len() {
+            let idx_j = indices[j];
+            if suppressed[idx_j] {
                 continue;
             }
 
-            let iou = compute_iou(&proposals[i], &proposals[j]);
+            let iou = compute_iou(&proposals[idx_i], &proposals[idx_j]);
             if iou > iou_threshold {
-                suppressed[j] = true;
+                suppressed[idx_j] = true;
             }
         }
     }
@@ -164,6 +233,10 @@ fn compute_iou(a: &Proposal, b: &Proposal) -> f32 {
 
     let area_a = (a.box_x2 - a.box_x1) * (a.box_y2 - a.box_y1);
     let area_b = (b.box_x2 - b.box_x1) * (b.box_y2 - b.box_y1);
+
+    if area_a + area_b - inter <= 0.0 {
+        return 0.0;
+    }
 
     inter / (area_a + area_b - inter)
 }

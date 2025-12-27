@@ -6,6 +6,7 @@ use log::info;
 use tokio::sync::Mutex;
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
+use image::DynamicImage;
 
 // Import new models
 pub mod face_detection;
@@ -25,6 +26,7 @@ pub trait Model: Send + Sync {
 #[derive(Debug)]
 pub enum ModelInput {
     Image(Vec<u8>),
+    ImageRaw(DynamicImage), // Added for optimized internal passing
     Text(String),
 }
 
@@ -60,6 +62,9 @@ impl Model for ImageModel {
                 let features = self.processor.process_image(image_data)?;
                 Ok(ModelOutput::Clip(features))
             }
+            // Chinese-clip-rs might not accept DynamicImage directly without update,
+            // so we might need to encode back if we receive ImageRaw here.
+            // But this path is usually external.
             _ => Err(anyhow::anyhow!("Invalid input type for ImageModel")),
         }
     }
@@ -137,6 +142,10 @@ impl Model for FaceRecognitionModelWrapper {
             ModelInput::Image(image_data) => {
                 let img = image::load_from_memory(image_data)?;
                 let output = self.inner.process(&img)?;
+                Ok(ModelOutput::FaceRecognition(output))
+            }
+            ModelInput::ImageRaw(img) => {
+                let output = self.inner.process(img)?;
                 Ok(ModelOutput::FaceRecognition(output))
             }
             _ => Err(anyhow::anyhow!("Invalid input for Face Recognition")),
