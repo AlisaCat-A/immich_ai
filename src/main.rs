@@ -16,6 +16,7 @@ use image::{DynamicImage, GenericImageView};
 
 mod models;
 mod model_registry;
+mod image_utils;
 
 #[cfg(test)]
 mod tests {
@@ -116,22 +117,6 @@ struct AppState {
     model_manager: SafeModelManager,
 }
 
-// Helper to crop face based on box
-fn crop_face(image: &DynamicImage, bbox: &[f32; 4]) -> DynamicImage {
-    let (x1, y1, x2, y2) = (bbox[0], bbox[1], bbox[2], bbox[3]);
-    let width = (x2 - x1).max(1.0) as u32;
-    let height = (y2 - y1).max(1.0) as u32;
-
-    // Check bounds
-    let (img_w, img_h) = image.dimensions();
-    let x = x1.max(0.0) as u32;
-    let y = y1.max(0.0) as u32;
-    let w = width.min(img_w - x);
-    let h = height.min(img_h - y);
-
-    image.view(x, y, w, h).to_image().into()
-}
-
 async fn predict(
     state: web::Data<AppState>,
     MultipartForm(form): MultipartForm<PredictForm>,
@@ -153,7 +138,10 @@ async fn predict(
                 let model = state.model_manager.get_model(&visual_entry.model_name).await
                     .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
 
-                let output = model.process(&models::ModelInput::Image(image_data.data.to_vec()))
+                let image_bytes = image_data.data.to_vec();
+                let output = web::block(move || model.process(&models::ModelInput::Image(image_bytes)))
+                    .await
+                    .map_err(|e| actix_web::error::ErrorInternalServerError(e))?
                     .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
 
                  if let models::ModelOutput::Clip(features) = output {
@@ -170,7 +158,10 @@ async fn predict(
                 let model = state.model_manager.get_model(&model_name).await
                     .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
 
-                let output = model.process(&models::ModelInput::Text(text.to_string()))
+                let text_val = text.to_string();
+                let output = web::block(move || model.process(&models::ModelInput::Text(text_val)))
+                    .await
+                    .map_err(|e| actix_web::error::ErrorInternalServerError(e))?
                     .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
 
                 if let models::ModelOutput::Clip(features) = output {
@@ -185,17 +176,24 @@ async fn predict(
         if let Some(detection_entry) = face_task.get(&ModelTypeEnum::Detection) {
              if let Some(image_data) = &form.image {
                 // 3a. Run Detection
-                let detection_model_name = &detection_entry.model_name;
-                let det_model = state.model_manager.get_model(detection_model_name).await
+                let detection_model_name = detection_entry.model_name.clone();
+                let det_model = state.model_manager.get_model(&detection_model_name).await
                     .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
 
-                let det_output = det_model.process(&models::ModelInput::Image(image_data.data.to_vec()))
+                let image_bytes = image_data.data.to_vec();
+                let det_output = web::block(move || det_model.process(&models::ModelInput::Image(image_bytes)))
+                    .await
+                    .map_err(|e| actix_web::error::ErrorInternalServerError(e))?
                     .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
 
                 let faces_data = if let models::ModelOutput::FaceDetection(output) = det_output {
                     // Load original image for cropping
                     let original_img = image::load_from_memory(&image_data.data)
                         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+
+                    // Inject Image Dimensions
+                    response_data.insert("imageHeight".to_string(), json!(original_img.height()));
+                    response_data.insert("imageWidth".to_string(), json!(original_img.width()));
 
                     if let Some(recognition_entry) = face_task.get(&ModelTypeEnum::Recognition) {
                         let rec_model_name = format!("{}_recognition", recognition_entry.model_name);
@@ -208,14 +206,24 @@ async fn predict(
                         for (i, bbox) in output.boxes.iter().enumerate() {
                             let score = output.scores.get(i).cloned().unwrap_or(0.0);
 
-                            // Crop face
-                            // Ideally use landmarks for alignment, but basic crop is fallback
-                            // TODO: Add full 5-point affine alignment here using output.landmarks[i]
-                            let face_crop = crop_face(&original_img, bbox);
+                            // Align face using landmarks
+                            let landmarks = output.landmarks.get(i).ok_or_else(|| actix_web::error::ErrorInternalServerError("Missing landmarks"))?;
+                            let face_crop = image_utils::align_face(&original_img, landmarks);
 
                             // Pass the crop directly to the recognition model (optimized path)
-                            let rec_output = rec_model.process(&models::ModelInput::ImageRaw(face_crop))
-                                .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+                            // Note: process() is blocking, so we should wrap this too if possible,
+                            // but since we are iterating, we might want to do it differently or just accept it's on a thread if we wrapped the whole block.
+                            // However, we are currently in the async handler main body (after awaiting det_output).
+                            // We should wrap the whole recognition loop or per-face.
+                            // Wrapping per-face adds overhead.
+                            // Better: move the whole logic into a web::block.
+
+                            let rec_model_clone = rec_model.clone();
+                            let rec_output = web::block(move || {
+                                rec_model_clone.process(&models::ModelInput::ImageRaw(face_crop))
+                            }).await
+                            .map_err(|e| actix_web::error::ErrorInternalServerError(e))?
+                            .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
 
                             if let models::ModelOutput::FaceRecognition(rec_result) = rec_output {
                                 detected_faces.push(json!({
@@ -266,6 +274,34 @@ async fn preload_models(model_manager: &SafeModelManager) {
         match model_manager.get_model(&text_model_name).await {
             Ok(_) => info!("Successfully preloaded {}", text_model_name),
             Err(e) => error!("Failed to preload {}: {}", text_model_name, e),
+        }
+    }
+
+    // Check for MACHINE_LEARNING_PRELOAD__CLIP__VISUAL
+    if let Ok(model_name) = env::var("MACHINE_LEARNING_PRELOAD__CLIP__VISUAL") {
+        info!("Preloading visual model: {}", model_name);
+        match model_manager.get_model(&model_name).await {
+            Ok(_) => info!("Successfully preloaded {}", model_name),
+            Err(e) => error!("Failed to preload {}: {}", model_name, e),
+        }
+    }
+
+    // Check for MACHINE_LEARNING_PRELOAD__FACIAL_RECOGNITION__DETECTION
+    if let Ok(model_name) = env::var("MACHINE_LEARNING_PRELOAD__FACIAL_RECOGNITION__DETECTION") {
+        info!("Preloading face detection model: {}", model_name);
+        match model_manager.get_model(&model_name).await {
+            Ok(_) => info!("Successfully preloaded {}", model_name),
+            Err(e) => error!("Failed to preload {}: {}", model_name, e),
+        }
+    }
+
+    // Check for MACHINE_LEARNING_PRELOAD__FACIAL_RECOGNITION__RECOGNITION
+    if let Ok(model_name) = env::var("MACHINE_LEARNING_PRELOAD__FACIAL_RECOGNITION__RECOGNITION") {
+        info!("Preloading face recognition model: {}", model_name);
+        let rec_model_name = format!("{}_recognition", model_name);
+        match model_manager.get_model(&rec_model_name).await {
+            Ok(_) => info!("Successfully preloaded {}", rec_model_name),
+            Err(e) => error!("Failed to preload {}: {}", rec_model_name, e),
         }
     }
 }
